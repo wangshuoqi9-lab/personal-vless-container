@@ -354,6 +354,7 @@ def supervise(xray, config, env):
     pending = None
     pending_action = None
     next_request = next_heartbeat = 0.0
+    next_request_wall = next_heartbeat_wall = 0.0
     blocked_reported = False
     pool = QuotaProcessPool()
     next_watchdog = next_watchdog_wall = 0.0
@@ -417,7 +418,8 @@ def supervise(xray, config, env):
                         grant.exhausted = True
                     else:
                         raise QuotaError("quota_service_unavailable")
-                    next_request = moment + (30 if grant.exhausted else 0)
+                    retry_delay = 30 if grant.exhausted else 0
+                    next_request, next_request_wall = moment + retry_delay, wall_now + retry_delay
                 except (OSError, ValueError, QuotaError, TimeoutError, urllib.error.URLError) as error:
                     allowed = {"quota_request_deadline", "quota_request_io",
                                "quota_request_invalid_reply", "quota_request_worker_failed"}
@@ -425,7 +427,7 @@ def supervise(xray, config, env):
                     print(f"category={category} action={action}", flush=True)
                     # Retry exactly the same sequence after an uncertain result.
                     # Metering and the existing deadline continue meanwhile.
-                    next_request = moment + 10
+                    next_request, next_request_wall = moment + 10, wall_now + 10
                 pending = pending_action = None
 
             used = meter.used()
@@ -436,27 +438,28 @@ def supervise(xray, config, env):
                 child = subprocess.Popen([xray, "run", "-c", str(config)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, env=core_env)
-                next_heartbeat = 0
+                next_heartbeat = next_heartbeat_wall = 0
                 blocked_reported = False
                 print("category=quota_proxy_open", flush=True)
 
             urgent_close = grant.period is not None and child is None and not blocked_reported
-            if pending is None and (moment >= next_request or urgent_close):
-                if grant.period and (moment >= next_heartbeat or (child is None and not blocked_reported)):
+            if pending is None and (moment >= next_request or wall_now >= next_request_wall or urgent_close):
+                if grant.period and (moment >= next_heartbeat or wall_now >= next_heartbeat_wall
+                                     or (child is None and not blocked_reported)):
                     pending_action = "status"
                     pending = pool.submit(api.call, "status", {"instance": grant.instance,
                         "period": grant.period, "usedBytes": str(used), "blocked": child is None})
-                    next_heartbeat = moment + 30
+                    next_heartbeat, next_heartbeat_wall = moment + 30, wall_now + 30
                     blocked_reported = child is None
                 elif (not grant.exhausted and (grant.period is None or grant.total - used <= RENEW_AT)):
                     pending_action = "lease"
                     pending = pool.submit(api.call, "lease", grant.request())
-                elif grant.exhausted and moment >= next_heartbeat:
+                elif grant.exhausted and (moment >= next_heartbeat or wall_now >= next_heartbeat_wall):
                     # Lease-less startup after exhaustion still rechecks with
                     # the central ledger; no local allowance can be invented.
                     pending_action = "lease"
                     pending = pool.submit(api.call, "lease", grant.request())
-                    next_heartbeat = moment + 30
+                    next_heartbeat, next_heartbeat_wall = moment + 30, wall_now + 30
         return 0
     finally:
         try:
