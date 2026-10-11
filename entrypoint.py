@@ -77,7 +77,8 @@ def main():
         # Only our fixed diagnostic identifiers; never exception paths, env or
         # request bodies. In particular the API token must never reach logs.
         allowed = {"quota_configuration_missing_or_invalid", "ambiguous_network_meter",
-                   "invalid_network_meter", "network_counter_regressed", "proxy_exited"}
+                   "invalid_network_meter", "network_counter_regressed", "proxy_exited",
+                   "network_meter_interfaces_changed", "network_meter_inactive"}
         reason = str(error) if isinstance(error, QuotaError) and str(error) in allowed else "os_error" if isinstance(error, OSError) else "quota_error"
         number = error.errno if isinstance(error, OSError) and type(error.errno) is int else 0
         print(f"category=quota_supervisor_fail_closed reason={reason} errno={number}", file=sys.stderr, flush=True)
