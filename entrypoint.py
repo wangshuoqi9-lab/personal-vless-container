@@ -1,7 +1,7 @@
-"""Render one private VLESS/WS inbound, then replace PID 1 with Xray.
+"""Render one private VLESS/WS inbound behind the durable quota supervisor.
 
 TLS terminates at the platform's HTTPS ingress. There is no public subscription
-endpoint, command execution endpoint, background agent, or runtime downloader.
+endpoint, command execution endpoint, or runtime downloader.
 """
 import json
 import os
@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from quota_supervisor import QuotaError, install_signals, supervise
 
 XRAY = "/usr/local/bin/xray"
 
@@ -69,10 +70,15 @@ def main():
         directory.rmdir()
         print("Xray configuration validation failed", file=sys.stderr)
         return 78
-    child_env = dict(os.environ)
-    child_env.pop("VLESS_UUID", None)
-    print("Starting configured personal VLESS WebSocket service", flush=True)
-    os.execve(XRAY, [XRAY, "run", "-c", str(path)], child_env)
+    install_signals()
+    try:
+        return supervise(XRAY, path, dict(os.environ))
+    except (OSError, QuotaError):
+        print("category=quota_supervisor_fail_closed", file=sys.stderr, flush=True)
+        return 75
+    finally:
+        path.unlink(missing_ok=True)
+        directory.rmdir()
 
 
 if __name__ == "__main__":
