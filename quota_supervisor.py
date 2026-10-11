@@ -4,7 +4,8 @@ Only the central ledger starts a new allowance. Container restarts receive a new
 instance identity and cannot recover an old grant. The entire container NIC TX
 counter is charged, including proxy framing and control-plane traffic.
 """
-import concurrent.futures
+import multiprocessing
+import tempfile
 from datetime import datetime, timezone
 import json
 import os
@@ -88,6 +89,119 @@ class QuotaAPI:
         except (ValueError, UnicodeError):
             raise QuotaError("invalid_quota_response") from None
         return status, body
+
+
+API_DEADLINE_SECONDS = 6.0
+API_RESULT_LIMIT = 16 * 1024
+
+
+def _quota_call_worker(output, function, args):
+    # The production parent has no worker threads. Fork keeps the credential
+    # out of argv/env/files; only a bounded response uses an anonymous file.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    try:
+        status, body = function(*args)
+        if type(status) is not int or not 100 <= status <= 599 or not isinstance(body, dict):
+            raise ValueError()
+        result = {"status": status, "body": body}
+    except (OSError, TimeoutError, urllib.error.URLError):
+        result = {"failure": "quota_request_io"}
+    except Exception:
+        result = {"failure": "quota_request_invalid_reply"}
+    raw = json.dumps(result, separators=(",", ":")).encode("utf8")
+    if len(raw) > API_RESULT_LIMIT:
+        raw = b'{"failure":"quota_request_invalid_reply"}'
+    output.write(raw)
+    output.flush()
+
+
+class QuotaProcessFuture:
+    def __init__(self, function, args, timeout=API_DEADLINE_SECONDS):
+        self.deadline = time.monotonic() + timeout
+        self.wall_deadline = time.time() + timeout
+        self.finished = False
+        self.value = None
+        self.failure = None
+        self.output = tempfile.TemporaryFile(mode="w+b")
+        self.process = multiprocessing.get_context("fork").Process(
+            target=_quota_call_worker, args=(self.output, function, args), daemon=True)
+        try:
+            self.process.start()
+        except BaseException:
+            self.output.close()
+            self.process.close()
+            raise
+
+    def _reap(self, kill=False):
+        if kill and self.process.is_alive():
+            self.process.kill()
+        self.process.join(timeout=0.25)
+        if self.process.is_alive():
+            # Never create a replacement while a prior request still exists.
+            raise QuotaError("quota_worker_cleanup_failed")
+        self.process.close()
+
+    def done(self):
+        if self.finished:
+            return True
+        if time.monotonic() >= self.deadline or time.time() >= self.wall_deadline:
+            self._reap(kill=True)
+            self.failure = "quota_request_deadline"
+        elif self.process.is_alive():
+            return False
+        else:
+            exitcode = self.process.exitcode
+            self._reap()
+            self.output.seek(0)
+            raw = self.output.read(API_RESULT_LIMIT + 1)
+            try:
+                value = json.loads(raw)
+                if exitcode != 0 or len(raw) > API_RESULT_LIMIT or not isinstance(value, dict):
+                    raise ValueError()
+                if "failure" in value:
+                    if value["failure"] not in {"quota_request_io", "quota_request_invalid_reply"}:
+                        raise ValueError()
+                    self.failure = value["failure"]
+                elif type(value.get("status")) is int and 100 <= value["status"] <= 599 and isinstance(value.get("body"), dict):
+                    self.value = (value["status"], value["body"])
+                else:
+                    raise ValueError()
+            except (ValueError, UnicodeError):
+                self.failure = "quota_request_worker_failed"
+        self.output.close()
+        self.finished = True
+        return True
+
+    def result(self):
+        if not self.done():
+            raise QuotaError("quota_request_not_ready")
+        if self.failure:
+            raise QuotaError(self.failure)
+        return self.value
+
+    def cancel(self):
+        if not self.finished:
+            try:
+                self._reap(kill=True)
+            finally:
+                self.output.close()
+            self.failure = "quota_request_cancelled"
+            self.finished = True
+
+
+class QuotaProcessPool:
+    def __init__(self):
+        self.pending = None
+
+    def submit(self, function, *args):
+        if self.pending is not None and not self.pending.done():
+            raise QuotaError("quota_request_already_pending")
+        self.pending = QuotaProcessFuture(function, args)
+        return self.pending
+
+    def shutdown(self, **_kwargs):
+        if self.pending is not None:
+            self.pending.cancel()
 
 
 class Meter:
@@ -174,6 +288,7 @@ class Grant:
         self.sequence = 0
         self.total = 0
         self.deadline = 0.0
+        self.expires_at = 0.0
         self.reset_at = 0.0
         self.exhausted = False
 
@@ -201,6 +316,7 @@ class Grant:
             raise QuotaError("invalid_grant_expiry")
         self.period, self.sequence, self.total = period, sequence, total
         self.reset_at, self.deadline = reset_at, monotonic + expires - now
+        self.expires_at = expires
         self.exhausted = amount == 0
 
     def heartbeat(self, value, now=None, monotonic=None):
@@ -213,11 +329,12 @@ class Grant:
         if expires > self.reset_at or not 0 < expires - now <= 660:
             raise QuotaError("invalid_heartbeat_expiry")
         self.deadline = monotonic + expires - now
+        self.expires_at = expires
 
     def admissible(self, used, monotonic=None):
         moment = time.monotonic() if monotonic is None else monotonic
         return (not self.exhausted and self.period is not None and used + RESERVE < self.total
-                and moment < self.deadline and time.time() < self.reset_at)
+                and moment < self.deadline and time.time() < min(self.expires_at, self.reset_at))
 
 
 def stop_core(child):
@@ -238,11 +355,25 @@ def supervise(xray, config, env):
     pending_action = None
     next_request = next_heartbeat = 0.0
     blocked_reported = False
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    pool = QuotaProcessPool()
+    next_watchdog = next_watchdog_wall = 0.0
+    last_watchdog_mono, last_watchdog_wall = time.monotonic(), time.time()
     core_env = {k: v for k, v in env.items() if k not in ("VLESS_UUID", "NODE_QUOTA_TOKEN")}
     try:
         while not STOP.wait(0.1):
             used, moment = meter.used(), time.monotonic()
+            wall_now = time.time()
+            if moment >= next_watchdog or wall_now >= next_watchdog_wall:
+                remaining = max(0, int(min(grant.deadline - moment,
+                    grant.expires_at - time.time(), grant.reset_at - time.time())))
+                print("category=quota_watchdog "
+                      f"core={'open' if child is not None else 'closed'} "
+                      f"api={'pending' if pending is not None else 'idle'} "
+                      f"remainingSeconds={remaining} "
+                      f"wallElapsed={int(wall_now - last_watchdog_wall)} "
+                      f"monoElapsed={int(moment - last_watchdog_mono)}", flush=True)
+                last_watchdog_wall, last_watchdog_mono = wall_now, moment
+                next_watchdog, next_watchdog_wall = moment + 60, wall_now + 60
             if not grant.admissible(used, moment):
                 if child is not None:
                     stop_core(child)
@@ -256,6 +387,8 @@ def supervise(xray, config, env):
                 action = pending_action
                 try:
                     status, result = pending.result()
+                    if status != 200:
+                        print(f"category=quota_api_response action={action} status={status}", flush=True)
                     if status == 409 and result.get("error") == "new_instance_required" and grant.period is None:
                         # The first lease may have committed just before a
                         # month boundary while its response was lost. It is
@@ -285,7 +418,11 @@ def supervise(xray, config, env):
                     else:
                         raise QuotaError("quota_service_unavailable")
                     next_request = moment + (30 if grant.exhausted else 0)
-                except (OSError, ValueError, QuotaError, TimeoutError, urllib.error.URLError):
+                except (OSError, ValueError, QuotaError, TimeoutError, urllib.error.URLError) as error:
+                    allowed = {"quota_request_deadline", "quota_request_io",
+                               "quota_request_invalid_reply", "quota_request_worker_failed"}
+                    category = str(error) if isinstance(error, QuotaError) and str(error) in allowed else "quota_request_failed"
+                    print(f"category={category} action={action}", flush=True)
                     # Retry exactly the same sequence after an uncertain result.
                     # Metering and the existing deadline continue meanwhile.
                     next_request = moment + 10
@@ -322,8 +459,10 @@ def supervise(xray, config, env):
                     next_heartbeat = moment + 30
         return 0
     finally:
-        stop_core(child)
-        pool.shutdown(wait=True, cancel_futures=True)
+        try:
+            stop_core(child)
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def install_signals():
