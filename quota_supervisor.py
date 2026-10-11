@@ -206,7 +206,16 @@ def supervise(xray, config, env):
                 action = pending_action
                 try:
                     status, result = pending.result()
-                    if status == 409 and re.fullmatch(r"20[0-9]{2}-(0[1-9]|1[0-2])", str(result.get("currentPeriod", ""))):
+                    if status == 409 and result.get("error") == "new_instance_required" and grant.period is None:
+                        # The first lease may have committed just before a
+                        # month boundary while its response was lost. It is
+                        # safe to abandon that identity: no core was opened.
+                        assert child is None
+                        grant = Grant()
+                        meter.new_period()
+                    elif status == 409 and result.get("error") == "instance_superseded":
+                        grant.exhausted = True
+                    elif status == 409 and re.fullmatch(r"20[0-9]{2}-(0[1-9]|1[0-2])", str(result.get("currentPeriod", ""))):
                         # Changing period is only accepted after the old process
                         # is gone. The server, not a local month check, grants it.
                         if grant.period and result["currentPeriod"] != grant.period:
