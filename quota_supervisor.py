@@ -91,30 +91,80 @@ class QuotaAPI:
 
 
 class Meter:
-    def __init__(self, root=Path("/sys/class/net")):
-        interfaces = sorted(p for p in root.iterdir() if p.name != "lo")
-        # The pod must have an unambiguous interface; never fall back to a
-        # process counter or silently undercount a second interface.
-        if len(interfaces) != 1:
-            raise QuotaError("ambiguous_network_meter")
-        self.path = interfaces[0] / "statistics/tx_bytes"
-        self.baseline = self.last = self.read()
+    def __init__(self, path=Path("/proc/self/net/dev")):
+        # proc/self observes this process's network namespace, even when a
+        # platform masks or exposes a different view through /sys/class/net.
+        # Select this source once; never silently switch or reset its baseline.
+        self.path = Path(path)
+        self.baseline = self.read()
+        self.last = self.baseline.copy()
+        print("category=quota_meter_ready source=proc_self_net_dev "
+              f"interfaceCount={len(self.baseline)}", flush=True)
 
     def read(self):
-        raw = self.path.read_text().strip()
-        if not re.fullmatch(r"[0-9]{1,22}", raw):
+        with self.path.open("rb") as file:
+            raw = file.read(65537)
+        if len(raw) > 65536:
             raise QuotaError("invalid_network_meter")
-        return int(raw)
+        try:
+            lines = raw.decode("ascii").splitlines()
+        except UnicodeError:
+            raise QuotaError("invalid_network_meter") from None
+        expected = (
+            ["Inter-", "Receive", "Transmit"],
+            ["face", "bytes packets errs drop fifo frame compressed multicast",
+             "bytes packets errs drop fifo colls carrier compressed"],
+        )
+        if len(lines) < 2 or any(
+                [" ".join(part.split()) for part in lines[index].split("|")] != header
+                for index, header in enumerate(expected)):
+            raise QuotaError("invalid_network_meter")
+        counters, seen = {}, set()
+        for line in lines[2:]:
+            name, separator, values = line.partition(":")
+            name, columns = name.strip(), values.split()
+            if (not separator or not re.fullmatch(r"[^\s:]{1,15}", name)
+                    or name in seen or len(columns) != 16
+                    or any(not re.fullmatch(r"[0-9]{1,20}", item) for item in columns)):
+                raise QuotaError("invalid_network_meter")
+            numbers = [int(item) for item in columns]
+            if any(item > (1 << 64) - 1 for item in numbers):
+                raise QuotaError("invalid_network_meter")
+            seen.add(name)
+            if name != "lo":
+                # All non-loopback interfaces are charged. Layered virtual
+                # interfaces may overcount; selecting just one could undercount.
+                counters[name] = numbers[8]
+        if not counters:
+            raise QuotaError("ambiguous_network_meter")
+        return counters
+
+    def _sample(self):
+        counters = self.read()
+        if counters.keys() != self.baseline.keys():
+            raise QuotaError("network_meter_interfaces_changed")
+        # Check each interface: growth elsewhere must not mask one counter reset.
+        if any(counters[name] < self.last[name] for name in counters):
+            raise QuotaError("network_counter_regressed")
+        self.last = counters.copy()
+        return counters
 
     def used(self):
-        counter = self.read()
-        if counter < self.last:
-            raise QuotaError("network_counter_regressed")
-        self.last = counter
-        return counter - self.baseline
+        counters = self._sample()
+        return sum(value - self.baseline[name] for name, value in counters.items())
+
+    def verify_activity(self):
+        # A completed HTTPS lease has transmitted bytes. Never open a proxy on
+        # an unproven/stub counter that stayed at zero throughout that request.
+        used = self.used()
+        if used <= 0:
+            raise QuotaError("network_meter_inactive")
+        return used
 
     def new_period(self):
-        self.baseline = self.last = self.read()
+        # The caller has already stopped the core and accepted a server period
+        # transition. Still reject interface replacement or counter regression.
+        self.baseline = self._sample().copy()
 
 
 class Grant:
@@ -243,6 +293,9 @@ def supervise(xray, config, env):
 
             used = meter.used()
             if child is None and grant.admissible(used):
+                used = meter.verify_activity()
+                if not grant.admissible(used):
+                    continue
                 child = subprocess.Popen([xray, "run", "-c", str(config)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, env=core_env)
